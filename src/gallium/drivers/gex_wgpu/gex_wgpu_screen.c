@@ -29458,6 +29458,43 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
       box = &block_box;
    }
 
+   /* A box past the edge of either texture, measured against the WebGPU
+    * textures themselves: WebGPU rejects the whole command buffer for it, and
+    * the copy then does nothing at all. Steam's 2019 login window copied
+    * 432x438 out of a 32x32 texture on every paint and stayed blank. What
+    * fits is copied, and the mismatch is said once with both the GL and the
+    * WebGPU sizes, since a resource whose texture is smaller than its
+    * width0 is a bug somewhere else. */
+   struct pipe_box fit_box;
+   if (!flip_y && box->height > 0 && box->depth == 1 &&
+       !util_format_is_compressed(src->format)) {
+      const int src_w = (int)MAX2(1u, wgpuTextureGetWidth(gex_src->texture) >> src_level);
+      const int src_h = (int)MAX2(1u, wgpuTextureGetHeight(gex_src->texture) >> src_level);
+      const int dst_w = (int)MAX2(1u, wgpuTextureGetWidth(gex_dst->texture) >> dst_level);
+      const int dst_h = (int)MAX2(1u, wgpuTextureGetHeight(gex_dst->texture) >> dst_level);
+      const int w = MIN3(box->width, src_w - box->x, dst_w - (int)dstx);
+      const int h = MIN3(box->height, src_h - box->y, dst_h - (int)dsty);
+      if (w != box->width || h != box->height) {
+         GEX_SAY_ONCE_PER((uint32_t)src_w * 131u + (uint32_t)box->width * 17u +
+                          (uint32_t)box->height * 7u + (uint32_t)dst_w) {
+            fprintf(stderr, "gex-wgpu: copy of %dx%d at %d,%d past a texture's "
+                    "edge, cut to %dx%d (source %dx%d, GL %ux%u; destination "
+                    "%dx%d at %u,%u, GL %ux%u)\n",
+                    box->width, box->height, box->x, box->y, MAX2(w, 0),
+                    MAX2(h, 0), src_w, src_h, src->width0, src->height0,
+                    dst_w, dst_h, dstx, dsty, dst->width0, dst->height0);
+         }
+         if (w <= 0 || h <= 0) {
+            gex_wgpu_local_encoder_release(screen, encoder);
+            return true;
+         }
+         fit_box = *box;
+         fit_box.width = w;
+         fit_box.height = h;
+         box = &fit_box;
+      }
+   }
+
    WGPUTexture scratch = NULL;
    static int copy_log = -1;
    if (copy_log < 0) {
@@ -52623,6 +52660,19 @@ gex_wgpu_fence_finish(struct pipe_screen *screen, struct pipe_context *ctx,
    return fence == NULL;
 }
 
+/* The video memory the player named (caps.video_memory, from
+ * override_vram_size), all of it free: WebGPU reports no use to subtract. Only
+ * called once caps.query_memory_info is on, which that size turns on. */
+static void
+gex_wgpu_query_memory_info(struct pipe_screen *screen,
+                           struct pipe_memory_info *info)
+{
+   const unsigned kib = screen->caps.video_memory * 1024u;
+   memset(info, 0, sizeof(*info));
+   info->total_device_memory = kib;
+   info->avail_device_memory = kib;
+}
+
 static void
 gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
 {
@@ -53431,6 +53481,19 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    caps->uma = false;
    caps->endianness = PIPE_ENDIAN_LITTLE;
 
+   /* override_vram_size, Mesa's driconf name for it, in MiB from the
+    * environment the page gives Mesa: the video memory GL_NVX_gpu_memory_info
+    * and GL_ATI_meminfo report (gex_wgpu_query_memory_info). WebGPU tells
+    * nothing about memory, so both are offered only when a size is named. */
+   {
+      const char *vram = getenv("override_vram_size");
+      const long mib = vram ? strtol(vram, NULL, 10) : 0;
+      if (mib > 0) {
+         caps->video_memory = (unsigned)MIN2(mib, 4194303L);
+         caps->query_memory_info = true;
+      }
+   }
+
    /* Deliberately absent, because the hooks behind them are: occlusion and
     * timer queries, transform feedback, shader storage and images, compute,
     * geometry and tessellation, texture buffers, conditional render,
@@ -54038,6 +54101,7 @@ gex_wgpu_screen_create(WGPUDevice device)
    /* Required alongside caps.query_timestamp: st/mesa calls this for
     * glGetInteger64v(GL_TIMESTAMP). Same CPU clock as the timer queries. */
    screen->base.get_timestamp = u_default_get_timestamp;
+   screen->base.query_memory_info = gex_wgpu_query_memory_info;
    screen->base.fence_reference = gex_wgpu_fence_reference;
    screen->base.fence_finish = gex_wgpu_fence_finish;
    screen->base.context_create = gex_wgpu_context_create;
