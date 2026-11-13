@@ -485,6 +485,11 @@ extern void gex_wgpu_jspi_signal(void);
  * edge's own. There is no single record index to look up there. */
 #define GEX_WGPU_PASSTHROUGH_BINDING \
    (GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + GEX_WGPU_MAX_SHADER_IMAGES)
+/* Each buffer texture's skew (gex_wgpu_buftex_skew), one word a slot, in a
+ * uniform block of the stage's: every stage that has buffer textures binds
+ * it, in the group they are in. */
+#define GEX_WGPU_BUFTEX_SKEWS_BINDING (GEX_WGPU_PASSTHROUGH_BINDING + 1)
+#define GEX_WGPU_BUFTEX_SKEWS_BYTES (GEX_WGPU_MAX_BUFFER_TEXTURES * 4)
 /* Rounded to four so a slot is a whole uvec4: the block is a *uniform* buffer
  * and WGSL gives a uniform array a 16-byte stride, so it is declared as an
  * array of uvec4 and a word is addressed as [w / 4][w % 4]. Both of those are
@@ -494,6 +499,11 @@ extern void gex_wgpu_jspi_signal(void);
 #define GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES              \
    (GEX_WGPU_MAX_SHADER_IMAGES *                         \
     GEX_WGPU_PACKED_IMAGE_HEADER_WORDS_PADDED * 4)
+/* gex_wgpu_driver_words: how many blocks one buffer of them holds, and each
+ * one's stride -- the largest block, and a multiple of 256, the most a
+ * uniform binding's offset may have to be aligned to. */
+#define GEX_WGPU_DRIVER_WORDS_ENTRIES 256
+#define GEX_WGPU_DRIVER_WORDS_STRIDE 512
 
 /* How many 32-bit words a texel of a buffer-texture format occupies, or 0 for
  * a format this driver cannot serve as one.
@@ -2553,6 +2563,16 @@ struct gex_wgpu_context {
     * rather than per resource: a header binding of its own cost each image a
     * second storage buffer, and the device grants ten per stage. */
    WGPUBuffer packed_image_headers;
+   /* The packed image headers this binding is assembling, by slot; the
+    * binding takes them from gex_wgpu_driver_words once every image is in. */
+   uint32_t packed_header_words[GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES / 4];
+   /* gex_wgpu_driver_words: blocks of driver-written words, each written
+    * once and never again, deduplicated by content. */
+   WGPUBuffer driver_words;
+   unsigned driver_words_used;
+   uint32_t driver_words_hash[GEX_WGPU_DRIVER_WORDS_ENTRIES];
+   uint32_t driver_words_bytes[GEX_WGPU_DRIVER_WORDS_ENTRIES];
+   uint8_t *driver_words_copy;
    struct pipe_resource **persistent;
    unsigned persistent_count;
    unsigned persistent_capacity;
@@ -4640,12 +4660,101 @@ gex_wgpu_buftex_binding_size(const struct pipe_sampler_view *view)
    return ALIGN_POT((view->u.buf.size / texel) * texel, 4);
 }
 
+/* How far a buffer texture's range starts past the storage binding that
+ * serves it, in bytes. GL's glTexBufferRange offsets need only be multiples
+ * of GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT, which this driver reports as 16, the
+ * desktop drivers' value; a storage binding's offset must be a multiple of
+ * the device's storage alignment (256 on most adapters). The binding starts
+ * at the offset rounded down to that, and the shader skips the difference,
+ * which it reads from the stage's skew block (GEX_WGPU_BUFTEX_SKEWS_BINDING)
+ * rather than from its variant key: a range that moves per batch would
+ * otherwise compile a variant per remainder. Reporting 256 instead was
+ * legal, and wined3d then
+ * made no view at all for a D3D11 shader resource view of a structured
+ * buffer at any other offset: a renderer that binds one instance buffer at
+ * a range per batch (text, icons and borders) drew most batches from
+ * an unbound view, which reads zero. */
+static uint64_t
+gex_wgpu_buftex_skew(const struct pipe_sampler_view *view)
+{
+   if (!view || view->target != PIPE_BUFFER || !view->texture)
+      return 0;
+   const uint64_t align =
+      MAX2(((const struct gex_wgpu_screen *)view->texture->screen)->storage_offset_alignment, 1u);
+   return view->u.buf.offset & (align - 1);
+}
+
+/* The storage binding for a bound buffer texture: from the offset rounded
+ * down to the storage alignment, over the skew and the view's whole texels. */
+static void
+gex_wgpu_buftex_binding(const struct pipe_sampler_view *view,
+                        uint64_t *offset, uint64_t *size)
+{
+   const uint64_t skew = gex_wgpu_buftex_skew(view);
+   *offset = view->u.buf.offset - skew;
+   *size = skew + gex_wgpu_buftex_binding_size(view);
+}
+
 struct gex_wgpu_buftex_lowering {
    const uint8_t *words;                                  /* per slot */
+   /* The skews (gex_wgpu_buftex_skews), a uniform block of one word a slot. */
+   nir_variable *skews;
    nir_variable *block[GEX_WGPU_MAX_BUFFER_TEXTURES];
    bool failed;
    char why[176];
 };
+
+/* GEX_WGPU_VARIANT_LOG=1: a line for every shader variant a stage builds,
+ * with the running total, which is how a renderer that compiles while it
+ * runs shows: after its first frames the total should stop moving. */
+static void
+gex_wgpu_variant_note(const char *kind)
+{
+   static unsigned total;
+   ++total;
+   if (GEX_GETENV_ONCE("GEX_WGPU_VARIANT_LOG"))
+      fprintf(stderr, "gex-wgpu: %s variant built, %u in all\n", kind, total);
+}
+
+/* The stage's skew block (GEX_WGPU_BUFTEX_SKEWS_BINDING): uvec4s, because a
+ * uniform array has a 16-byte stride, so slot s is element s / 4, component
+ * s % 4. Made at variant time, after gex_wgpu_lower_gallium_ubos, as the
+ * packed image header block is, so the UBO numbering never meets it. */
+static nir_variable *
+gex_wgpu_buftex_skew_block(nir_shader *nir)
+{
+   const struct glsl_type *words =
+      glsl_array_type(glsl_uvec4_type(), GEX_WGPU_MAX_BUFFER_TEXTURES / 4, 16);
+   struct glsl_struct_field field = {0};
+   field.type = words;
+   field.name = "data";
+   const struct glsl_type *block = glsl_interface_type(
+      &field, 1, GLSL_INTERFACE_PACKING_STD430, false, "gex_buftex_skews");
+   nir_variable *var =
+      nir_variable_create(nir, nir_var_mem_ubo, block, "gex_buftex_skews");
+   var->interface_type = block;
+   var->data.binding = GEX_WGPU_BUFTEX_SKEWS_BINDING;
+   var->data.driver_location = 0;
+   var->data.explicit_binding = true;
+   var->data.access |= ACCESS_NON_WRITEABLE;
+   return var;
+}
+
+/* The skew of a slot's binding, in bytes: a word of the stage's skew block.
+ * Read per draw rather than built into the module, because a renderer that
+ * binds one buffer at a moving range per batch would otherwise compile a new
+ * variant whenever the range's remainder changed. */
+static nir_def *
+gex_wgpu_buftex_skew_load(nir_builder *b,
+                          const struct gex_wgpu_buftex_lowering *state,
+                          unsigned slot)
+{
+   nir_def *quad = nir_load_deref(
+      b, nir_build_deref_array(
+            b, nir_build_deref_struct(b, nir_build_deref_var(b, state->skews), 0),
+            nir_imm_int(b, (int)(slot / 4))));
+   return nir_channel(b, quad, slot % 4);
+}
 
 static bool
 gex_wgpu_lower_buffer_texture(nir_builder *b, nir_instr *instr, void *data)
@@ -4693,7 +4802,9 @@ gex_wgpu_lower_buffer_texture(nir_builder *b, nir_instr *instr, void *data)
          b, nir_build_deref_var(b, state->block[slot]), 0);
       nir_def *length = nir_deref_buffer_array_length(b, 32, &words->def);
       nir_def *texels =
-         nir_udiv_imm(b, nir_imul_imm(b, length, 4), MAX2(texel_bytes, 1u));
+         nir_udiv_imm(b, nir_isub(b, nir_imul_imm(b, length, 4),
+                                  gex_wgpu_buftex_skew_load(b, state, slot)),
+                      MAX2(texel_bytes, 1u));
       nir_def_rewrite_uses(&tex->def, nir_trim_vector(b, texels, tex->def.num_components));
       nir_instr_remove(instr);
       return true;
@@ -4738,7 +4849,8 @@ gex_wgpu_lower_buffer_texture(nir_builder *b, nir_instr *instr, void *data)
     * several texels into one, so the component's word and its position inside
     * that word both come out of the byte offset. */
    nir_def *byte_base =
-      nir_imul_imm(b, tex->src[coord_src].src.ssa, n * bytes);
+      nir_iadd(b, nir_imul_imm(b, tex->src[coord_src].src.ssa, n * bytes),
+               gex_wgpu_buftex_skew_load(b, state, slot));
    nir_def *comp[4];
    for (unsigned k = 0; k < 4; ++k) {
       if (k >= n) {
@@ -4816,7 +4928,7 @@ gex_wgpu_buftex_words(unsigned buftex_count, const uint8_t *buftex_slots,
                       struct pipe_sampler_view *const *views,
                       uint8_t words[GEX_WGPU_MAX_BUFFER_TEXTURES])
 {
-   memset(words, 0, GEX_WGPU_MAX_BUFFER_TEXTURES);
+   memset(words, 0, GEX_WGPU_MAX_BUFFER_TEXTURES * sizeof(*words));
    if (!buftex_slots || !views)
       return;
    for (unsigned i = 0; i < buftex_count; ++i) {
@@ -4842,6 +4954,10 @@ gex_wgpu_apply_buffer_textures(nir_shader *nir, unsigned buftex_count,
       return true;
    struct gex_wgpu_buftex_lowering state = {0};
    state.words = words;
+   state.skews = gex_wgpu_buftex_skew_block(nir);
+   /* In the set the stage's buffer textures are in. */
+   state.skews->data.descriptor_set = stage == MESA_SHADER_VERTEX ? 1
+      : stage == MESA_SHADER_COMPUTE ? 0 : 2;
    for (unsigned i = 0; i < buftex_count; ++i) {
       const unsigned slot = buftex_slots[i];
       char name[32];
@@ -7148,6 +7264,16 @@ static WGPUBuffer
 gex_wgpu_packed_image_write_header(struct gex_wgpu_context *ctx, unsigned slot,
                                    const uint32_t words[]);
 
+static bool gex_wgpu_driver_words(struct gex_wgpu_context *ctx,
+                                  const void *words, uint32_t bytes,
+                                  WGPUBuffer *buffer, uint64_t *offset);
+static bool gex_wgpu_buftex_skews(struct gex_wgpu_context *ctx,
+                                  unsigned buftex_count,
+                                  const uint8_t *buftex_slots,
+                                  struct pipe_sampler_view *const *views,
+                                  WGPUBuffer *buffer, uint64_t *offset);
+static bool gex_wgpu_packed_headers(struct gex_wgpu_context *ctx,
+                                    WGPUBuffer *buffer, uint64_t *offset);
 static WGPUBuffer gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx,
                                              unsigned slot,
                                              const struct pipe_image_view *iv,
@@ -17211,6 +17337,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    memcpy(cached->fetch_formats, fetch_formats, sizeof(fetch_formats));
    cached->fetch_samples = fetch_samples;
    memcpy(cached->buftex_words, want_buftex, sizeof(cached->buftex_words));
+   gex_wgpu_variant_note("fragment");
    cached->sampler_mask = sampler_mask;
    cached->color_output_type = wanted_output;
    cached->coord_replace = coord_replace;
@@ -27817,6 +27944,7 @@ gex_wgpu_compute_module(struct gex_wgpu_context *ctx,
       cached->last_level[slot] = view ? (uint8_t)view->u.tex.last_level : 0u;
    }
    memcpy(cached->buftex_words, want_buftex, sizeof(cached->buftex_words));
+   gex_wgpu_variant_note("compute");
    memcpy(cached->image_formats, compute->images.formats,
           sizeof(cached->image_formats));
    cached->module = module;
@@ -28006,10 +28134,12 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
     * header and the texel data. */
    WGPUBindGroupLayoutEntry
       entries[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS +
-              3 * GEX_WGPU_MAX_SHADER_IMAGES + 2 * GEX_WGPU_MAX_SAMPLERS];
+              3 * GEX_WGPU_MAX_SHADER_IMAGES + 2 * GEX_WGPU_MAX_SAMPLERS +
+              /* the buffer textures' skew block */ 1];
    WGPUBindGroupEntry
       bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS +
-               3 * GEX_WGPU_MAX_SHADER_IMAGES + 2 * GEX_WGPU_MAX_SAMPLERS];
+               3 * GEX_WGPU_MAX_SHADER_IMAGES + 2 * GEX_WGPU_MAX_SAMPLERS +
+               1];
    WGPUTextureView image_views[GEX_WGPU_MAX_SHADER_IMAGES] = {0};
    unsigned image_view_count = 0;
    unsigned count = 0;
@@ -28144,7 +28274,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
        * the dispatch lost every side effect the shader had, for a case GL
        * defines. */
       WGPUBuffer buftex_buffer;
-      uint64_t buftex_offset;
+      uint64_t buftex_offset, buftex_size = 0;
       bool buftex_placeholder = false;
       if (!view || view->target != PIPE_BUFFER || !view->texture) {
          static bool said;
@@ -28160,7 +28290,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          buftex_placeholder = true;
       } else {
          buftex_buffer = gex_resource(view->texture)->buffer;
-         buftex_offset = view->u.buf.offset;
+         gex_wgpu_buftex_binding(view, &buftex_offset, &buftex_size);
       }
       entries[count] =
          (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
@@ -28182,11 +28312,33 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
        *   (BufferBindingType::ReadOnlyStorage).
        *
        * The placeholder is bound whole: an explicit zero is a rejected
-       * binding, and `view` is NULL on that path anyway.
+       * binding, and `view` is NULL on that path anyway. From the
+       * storage-aligned offset below the view's (gex_wgpu_buftex_binding).
        */
       bindings[count].size = buftex_placeholder
          ? ctx->placeholder_storage->width0
-         : gex_wgpu_buftex_binding_size(view);
+         : buftex_size;
+      ++count;
+   }
+
+   /* Their skew block; see GEX_WGPU_BUFTEX_SKEWS_BINDING. */
+   if (compute->buftex_count) {
+      entries[count] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entries[count].binding = GEX_WGPU_BUFTEX_SKEWS_BINDING;
+      entries[count].visibility = WGPUShaderStage_Compute;
+      entries[count].buffer.type = WGPUBufferBindingType_Uniform;
+      entries[count].buffer.hasDynamicOffset = false;
+      entries[count].buffer.minBindingSize = GEX_WGPU_BUFTEX_SKEWS_BYTES;
+      bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      bindings[count].binding = GEX_WGPU_BUFTEX_SKEWS_BINDING;
+      bindings[count].size = GEX_WGPU_BUFTEX_SKEWS_BYTES;
+      if (!gex_wgpu_buftex_skews(ctx, compute->buftex_count,
+                                 compute->buftex_slots,
+                                 ctx->compute_sampler_views,
+                                 &bindings[count].buffer,
+                                 &bindings[count].offset))
+         goto release_views;
       ++count;
    }
 
@@ -28220,6 +28372,10 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       packed_write_of[packed_total] = true;
       ++packed_total;
    }
+   /* The header entry's buffer and offset come last, once every image's
+    * header is in (gex_wgpu_packed_headers). */
+   unsigned header_at = ~0u;
+   memset(ctx->packed_header_words, 0, sizeof(ctx->packed_header_words));
    for (unsigned i = 0; i < packed_total; ++i) {
       const unsigned slot = packed_slot_of[i];
       const struct pipe_image_view *iv =
@@ -28267,9 +28423,15 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          bindings[count].offset = half ? data_offset : 0;
          bindings[count].size =
             half ? size : GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
+         if (!half)
+            header_at = count;
          ++count;
       }
    }
+   if (header_at != ~0u &&
+       !gex_wgpu_packed_headers(ctx, &bindings[header_at].buffer,
+                                &bindings[header_at].offset))
+      goto release_views;
 
    /* Slots whose depth view this dispatch reads as float; see below. */
    uint32_t compute_depth_as_float = 0;
@@ -32005,6 +32167,7 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    }
    free(error);
    memcpy(variant->buftex_words, want_buftex, sizeof(variant->buftex_words));
+   gex_wgpu_variant_note("varying");
    variant->next = *cache;
    *cache = variant;
    return variant;
@@ -33619,6 +33782,7 @@ gex_wgpu_gs_module(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs)
                               cached->swizzles, cached->targets,
                               cached->first_level, cached->last_level);
    memcpy(cached->buftex_words, want_buftex, sizeof(cached->buftex_words));
+   gex_wgpu_variant_note("geometry");
    cached->module = module;
    cached->next = gs->variants;
    gs->variants = cached;
@@ -34283,6 +34447,7 @@ gex_wgpu_tes_variant_get(struct pipe_context *pipe, struct gex_wgpu_tes *tes,
    variant->tcs_patch_outputs = *producer_patch;
    variant->verts_per_patch = verts_per_patch;
    memcpy(variant->buftex_words, want_buftex, sizeof(variant->buftex_words));
+   gex_wgpu_variant_note("tess eval");
    if (key_textures)
       gex_wgpu_texture_keys_fill(tes->textures.count, tes->textures.slots,
                                  samplers, views, variant->sampler_keys,
@@ -34593,6 +34758,7 @@ gex_wgpu_tcs_variant_module(struct gex_wgpu_context *ctx,
                               cached->swizzles, cached->targets,
                               cached->first_level, cached->last_level);
    memcpy(cached->buftex_words, want_buftex, sizeof(cached->buftex_words));
+   gex_wgpu_variant_note("tess control");
    cached->module = module;
    cached->next = tcs->variants;
    tcs->variants = cached;
@@ -36005,6 +36171,8 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    /* And the packed ones, two bindings each over the buffer the shader packs
     * into. gex_wgpu_flush_packed_images below copies them back into their
     * textures once the pass has ended. */
+   unsigned header_at = ~0u;
+   memset(ctx->packed_header_words, 0, sizeof(ctx->packed_header_words));
    for (unsigned i = 0; i < ctx->vs->capture_images.packed_count; ++i) {
       const unsigned slot = ctx->vs->capture_images.packed_slots[i];
       const struct pipe_image_view *iv =
@@ -36055,8 +36223,20 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
          ubo_bindings[ubo_total].offset = half ? data_offset : 0;
          ubo_bindings[ubo_total].size =
             half ? packed_size : GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
+         if (!half)
+            header_at = ubo_total;
          ++ubo_total;
       }
+   }
+   if (header_at != ~0u &&
+       !gex_wgpu_packed_headers(ctx, &ubo_bindings[header_at].buffer,
+                                &ubo_bindings[header_at].offset)) {
+      fprintf(stderr, "gex-wgpu: vertex capture declined (no packed image "
+              "headers)\n");
+      for (unsigned r = 0; r < capture_image_view_count; ++r)
+         wgpuTextureViewRelease(capture_image_views[r]);
+      gex_fail(ctx);
+      return false;
    }
 
    /* Two writable storage bindings over one range is refused by WebGPU with a
@@ -36411,13 +36591,13 @@ gex_wgpu_bind_textures_from(struct pipe_context *pipe,
          size = ctx->placeholder_storage->width0;
       } else {
          buffer = gex_resource(bufview->texture)->buffer;
-         offset = bufview->u.buf.offset;
          /* Rounded up to four: WebGPU wants a storage binding's size to be a
           * multiple of four and a narrow buffer texture need not be -- five
           * R8 texels is five bytes. The allocation is 16-aligned so this
           * never reaches past the buffer, and the extra bytes are outside
-          * every texel the shader can address. */
-         size = gex_wgpu_buftex_binding_size(bufview);
+          * every texel the shader can address. From the storage-aligned
+          * offset below the view's (gex_wgpu_buftex_binding). */
+         gex_wgpu_buftex_binding(bufview, &offset, &size);
       }
       const unsigned at = group->count;
       group->binding[at] = textures->buftex_bindings[i];
@@ -36427,6 +36607,21 @@ gex_wgpu_bind_textures_from(struct pipe_context *pipe,
       /* `var<storage, read>`, which the layout has to agree with. */
       group->storage_mask |= UINT64_C(1) << at;
       group->readonly_mask |= UINT64_C(1) << at;
+      ++group->count;
+   }
+   /* Their skew block (GEX_WGPU_BUFTEX_SKEWS_BINDING): a uniform buffer,
+    * which is what an entry no mask claims is. */
+   if (textures->buftex_count) {
+      struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+      if (group->count >= GEX_WGPU_MAX_GROUP_BINDINGS)
+         return false;
+      const unsigned at = group->count;
+      group->binding[at] = GEX_WGPU_BUFTEX_SKEWS_BINDING;
+      group->size[at] = GEX_WGPU_BUFTEX_SKEWS_BYTES;
+      if (!gex_wgpu_buftex_skews(ctx, textures->buftex_count,
+                                 textures->buftex_slots, views,
+                                 &group->buffer[at], &group->offset[at]))
+         return false;
       ++group->count;
    }
    return true;
@@ -36521,6 +36716,8 @@ gex_wgpu_bind_stage_packed_images(struct gex_wgpu_context *ctx,
                                   const char *stage_name,
                                   struct gex_wgpu_bindings *group)
 {
+   unsigned header_at = ~0u;
+   memset(ctx->packed_header_words, 0, sizeof(ctx->packed_header_words));
    for (unsigned i = 0; i < images->packed_count; ++i) {
       const unsigned slot = images->packed_slots[i];
       const struct pipe_image_view *iv = &ctx->shader_images[stage][slot];
@@ -36558,6 +36755,8 @@ gex_wgpu_bind_stage_packed_images(struct gex_wgpu_context *ctx,
          group->buffer[at] = half ? buffer : header;
          group->offset[at] = half ? data_offset : 0;
          group->size[at] = half ? size : GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
+         if (!half)
+            header_at = at;
          /* The header is a *uniform* buffer and the data a storage one, and
           * the layout has to say which: an entry with no mask is uniform. Not
           * a saving so much as a requirement -- the module declares the block
@@ -36583,6 +36782,13 @@ gex_wgpu_bind_stage_packed_images(struct gex_wgpu_context *ctx,
          }
          ++group->count;
       }
+   }
+   if (header_at != ~0u &&
+       !gex_wgpu_packed_headers(ctx, &group->buffer[header_at],
+                                &group->offset[header_at])) {
+      fprintf(stderr, "gex-wgpu: %s declined (no packed image headers)\n",
+              stage_name);
+      return false;
    }
    return true;
 }
@@ -40776,6 +40982,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       variant->clip_halfz = want_halfz;
       variant->wide = *want_wide;
       memcpy(variant->buftex_words, want_buftex, sizeof(variant->buftex_words));
+      gex_wgpu_variant_note("interp");
       memcpy(variant->viewport, want, sizeof(variant->viewport));
       memcpy(variant->attrib_unpack, want_unpack,
              sizeof(variant->attrib_unpack));
@@ -41916,16 +42123,109 @@ gex_wgpu_packed_image_write_header(struct gex_wgpu_context *ctx, unsigned slot,
       if (!ctx->packed_image_headers)
          return NULL;
    }
-   /* A queue write is ordered against the submit that follows, so writing
-    * every bound image's header before the batch goes out is enough -- the
-    * same rule the persistent mappings rest on. */
-   uint32_t padded[GEX_WGPU_PACKED_IMAGE_HEADER_WORDS_PADDED] = {0};
+   /* Into the headers the binding is assembling, not into a buffer: a queue
+    * write lands before the whole batch it is submitted with, so two draws
+    * in one batch that bound different images at a slot both read the
+    * second's header. The binding takes the finished block from
+    * gex_wgpu_driver_words (gex_wgpu_packed_headers), and the buffer handed
+    * back here only says the header is in. */
+   uint32_t *padded = ctx->packed_header_words +
+                      slot * GEX_WGPU_PACKED_IMAGE_HEADER_WORDS_PADDED;
+   memset(padded, 0, GEX_WGPU_PACKED_IMAGE_HEADER_WORDS_PADDED * 4);
    memcpy(padded, words, GEX_WGPU_PACKED_IMAGE_HEADER_WORDS * 4);
-   wgpuQueueWriteBuffer(
-      screen->queue, ctx->packed_image_headers,
-      (uint64_t)slot * GEX_WGPU_PACKED_IMAGE_HEADER_WORDS_PADDED * 4, padded,
-      sizeof(padded));
    return ctx->packed_image_headers;
+}
+
+/* A block of driver-written words a draw or dispatch binds as a uniform
+ * buffer, at a place in one buffer that is written once and never again:
+ * the block is deduplicated by content, so a draw binding what an earlier
+ * one did gets the same buffer and offset, and the bind group cached for it
+ * still serves. Writing such words into one fixed place per draw is wrong,
+ * not slow: a queue write lands before the whole batch it is submitted with,
+ * so every draw in the batch read the last one's. When the buffer is full a
+ * new one starts; bind groups recorded against the old one hold it. */
+static bool
+gex_wgpu_driver_words(struct gex_wgpu_context *ctx, const void *words,
+                      uint32_t bytes, WGPUBuffer *buffer, uint64_t *offset)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   if (!bytes || bytes > GEX_WGPU_DRIVER_WORDS_STRIDE)
+      return false;
+   if (!ctx->driver_words_copy) {
+      ctx->driver_words_copy = calloc(GEX_WGPU_DRIVER_WORDS_ENTRIES,
+                                      GEX_WGPU_DRIVER_WORDS_STRIDE);
+      if (!ctx->driver_words_copy)
+         return false;
+   }
+   const uint32_t hash = XXH32(words, bytes, bytes);
+   if (ctx->driver_words) {
+      for (unsigned i = 0; i < ctx->driver_words_used; ++i) {
+         if (ctx->driver_words_hash[i] != hash ||
+             ctx->driver_words_bytes[i] != bytes ||
+             memcmp(ctx->driver_words_copy +
+                       (size_t)i * GEX_WGPU_DRIVER_WORDS_STRIDE,
+                    words, bytes) != 0)
+            continue;
+         *buffer = ctx->driver_words;
+         *offset = (uint64_t)i * GEX_WGPU_DRIVER_WORDS_STRIDE;
+         return true;
+      }
+   }
+   if (!ctx->driver_words ||
+       ctx->driver_words_used == GEX_WGPU_DRIVER_WORDS_ENTRIES) {
+      if (ctx->driver_words)
+         wgpuBufferRelease(ctx->driver_words);
+      WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+      desc.size = (uint64_t)GEX_WGPU_DRIVER_WORDS_ENTRIES *
+                  GEX_WGPU_DRIVER_WORDS_STRIDE;
+      desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+      ctx->driver_words = wgpuDeviceCreateBuffer(screen->device, &desc);
+      ctx->driver_words_used = 0;
+      if (!ctx->driver_words)
+         return false;
+   }
+   const unsigned i = ctx->driver_words_used++;
+   ctx->driver_words_hash[i] = hash;
+   ctx->driver_words_bytes[i] = bytes;
+   memcpy(ctx->driver_words_copy + (size_t)i * GEX_WGPU_DRIVER_WORDS_STRIDE,
+          words, bytes);
+   wgpuQueueWriteBuffer(screen->queue, ctx->driver_words,
+                        (uint64_t)i * GEX_WGPU_DRIVER_WORDS_STRIDE, words,
+                        bytes);
+   *buffer = ctx->driver_words;
+   *offset = (uint64_t)i * GEX_WGPU_DRIVER_WORDS_STRIDE;
+   return true;
+}
+
+/* The skew block (GEX_WGPU_BUFTEX_SKEWS_BINDING) for a stage's buffer
+ * textures as bound now: each slot's gex_wgpu_buftex_skew in bytes. */
+static bool
+gex_wgpu_buftex_skews(struct gex_wgpu_context *ctx, unsigned buftex_count,
+                      const uint8_t *buftex_slots,
+                      struct pipe_sampler_view *const *views,
+                      WGPUBuffer *buffer, uint64_t *offset)
+{
+   uint32_t skews[GEX_WGPU_MAX_BUFFER_TEXTURES] = {0};
+   for (unsigned i = 0; i < buftex_count && buftex_slots && views; ++i) {
+      const unsigned slot = buftex_slots[i];
+      if (slot < GEX_WGPU_MAX_BUFFER_TEXTURES)
+         skews[slot] = (uint32_t)gex_wgpu_buftex_skew(views[slot]);
+   }
+   return gex_wgpu_driver_words(ctx, skews, sizeof(skews), buffer, offset);
+}
+
+/* The packed image headers a binding assembled (ctx->packed_header_words),
+ * as a block of gex_wgpu_driver_words; the slots it bound no image at read
+ * as zero. Clears them for the next binding. */
+static bool
+gex_wgpu_packed_headers(struct gex_wgpu_context *ctx, WGPUBuffer *buffer,
+                        uint64_t *offset)
+{
+   const bool ok = gex_wgpu_driver_words(ctx, ctx->packed_header_words,
+                                         sizeof(ctx->packed_header_words),
+                                         buffer, offset);
+   memset(ctx->packed_header_words, 0, sizeof(ctx->packed_header_words));
+   return ok;
 }
 
 static WGPUBuffer
@@ -49395,13 +49695,18 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    const unsigned vertex_group_count =
       ctx->vs->ubo_count + ctx->vs->ssbo_count + ctx->vs->buftex_count +
       vs_packed_entries + ctx->vs->image_count +
-      (ctx->vs->reads_draw_params ? 1u : 0u) + (vs_records ? 1u : 0u);
+      (ctx->vs->reads_draw_params ? 1u : 0u) + (vs_records ? 1u : 0u) +
+      /* The buffer textures' skew block, last; see
+       * GEX_WGPU_BUFTEX_SKEWS_BINDING. */
+      (ctx->vs->buftex_count ? 1u : 0u);
    const unsigned fragment_group_count =
       ctx->fs->ubo_count + ctx->fs->ssbo_count + ctx->fs->image_count +
       ctx->fs->buftex_count +
       /* One shared header binding plus one data binding per image; see
        * GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES. */
-      (ctx->fs->packed_image_count ? 1 + ctx->fs->packed_image_count : 0);
+      (ctx->fs->packed_image_count ? 1 + ctx->fs->packed_image_count : 0) +
+      /* The buffer textures' skew block, last. */
+      (ctx->fs->buftex_count ? 1u : 0u);
    const bool needs_vertex_constant = vertex_group_count != 0;
    const bool needs_fragment_constant = fragment_group_count != 0;
    /* Whether this draw's constant buffers can keep their dynamic offsets.
@@ -49913,7 +50218,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                or the other, never both, but a packed one
                                takes two bindings */
                             3 * GEX_WGPU_MAX_SHADER_IMAGES +
-                            /* the draw parameters */ 1];
+                            /* the draw parameters, the passthrough records
+                               and the buffer textures' skew block */ 3];
    WGPUBindGroupLayoutEntry
       fragment_layout_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
                               GEX_WGPU_MAX_SHADER_BUFFERS +
@@ -49922,7 +50228,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                * but a packed one takes two bindings, a
                                * read-only header and the texel data */
                               3 * GEX_WGPU_MAX_SHADER_IMAGES +
-                              GEX_WGPU_MAX_BUFFER_TEXTURES];
+                              GEX_WGPU_MAX_BUFFER_TEXTURES +
+                              /* the buffer textures' skew block */ 1];
    /* The sharing decision predicted `depth_as_float` before it was computed
     * above; hold every borrowed binding to the real one. A slot borrowing a
     * binding of another type is a rejected pipeline, and one of another
@@ -50196,6 +50503,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       vertex_layout_entries[at].buffer.type =
          WGPUBufferBindingType_ReadOnlyStorage;
    }
+   if (ctx->vs->buftex_count) {
+      const unsigned at = vertex_group_count - 1;
+      vertex_layout_entries[at] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      vertex_layout_entries[at].binding = GEX_WGPU_BUFTEX_SKEWS_BINDING;
+      vertex_layout_entries[at].visibility = WGPUShaderStage_Vertex;
+      vertex_layout_entries[at].buffer.type = WGPUBufferBindingType_Uniform;
+      vertex_layout_entries[at].buffer.hasDynamicOffset = false;
+      vertex_layout_entries[at].buffer.minBindingSize = GEX_WGPU_BUFTEX_SKEWS_BYTES;
+   }
    for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
       const unsigned slot = ctx->fs->ubo_slots[i];
       const bool storage = ctx->fs->ubo_storage_mask & (UINT64_C(1) << i);
@@ -50365,6 +50682,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                : WGPUBufferBindingType_ReadOnlyStorage;
          fragment_layout_entries[at].buffer.hasDynamicOffset = false;
       }
+   }
+   if (ctx->fs->buftex_count) {
+      const unsigned at = fragment_group_count - 1;
+      fragment_layout_entries[at] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      fragment_layout_entries[at].binding = GEX_WGPU_BUFTEX_SKEWS_BINDING;
+      fragment_layout_entries[at].visibility = WGPUShaderStage_Fragment;
+      fragment_layout_entries[at].buffer.type = WGPUBufferBindingType_Uniform;
+      fragment_layout_entries[at].buffer.hasDynamicOffset = false;
+      fragment_layout_entries[at].buffer.minBindingSize = GEX_WGPU_BUFTEX_SKEWS_BYTES;
    }
    const unsigned group_count = needs_vertex_texture ? 4
       : needs_fragment_constant ? 3
@@ -50715,7 +51042,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                  GEX_WGPU_MAX_BUFFER_TEXTURES +
                  /* images, plain and packed, as in the layout above */
                  3 * GEX_WGPU_MAX_SHADER_IMAGES +
-                 /* the draw parameters */ 1];
+                 /* the draw parameters, the passthrough records and the
+                    buffer textures' skew block */ 3];
       for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
          const unsigned slot = ctx->vs->ubo_slots[i];
          const struct pipe_constant_buffer *constant =
@@ -50827,10 +51155,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             buftex_size = ctx->placeholder_storage->width0;
          } else {
             buftex_buffer = gex_resource(view->texture)->buffer;
-            buftex_offset = view->u.buf.offset;
-            /* Whole texels, rounded to four; see
-             * gex_wgpu_buftex_binding_size. */
-            buftex_size = gex_wgpu_buftex_binding_size(view);
+            /* Whole texels, rounded to four, from the storage-aligned
+             * offset below the view's; see gex_wgpu_buftex_binding. */
+            gex_wgpu_buftex_binding(view, &buftex_offset, &buftex_size);
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = ctx->vs->buftex_bindings[i];
@@ -50839,6 +51166,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[at].size = buftex_size;
       }
       /* Packed images, as in the layout above. */
+      memset(ctx->packed_header_words, 0, sizeof(ctx->packed_header_words));
       for (unsigned i = 0; i < ctx->vs->packed_image_count; ++i) {
          const unsigned base = ctx->vs->ubo_count + ctx->vs->ssbo_count +
                                ctx->vs->buftex_count;
@@ -50880,6 +51208,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             entries[at].size =
                half ? size : GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
          }
+      }
+      if (ctx->vs->packed_image_count) {
+         const unsigned header_at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
+                               ctx->vs->buftex_count;
+         if (!gex_wgpu_packed_headers(ctx, &entries[header_at].buffer,
+                                      &entries[header_at].offset))
+            GEX_DRAW_DROP();
       }
       /* The views for those images; see the layout above. */
       for (unsigned i = 0; i < ctx->vs->image_count; ++i) {
@@ -50939,6 +51274,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[at].offset = 0;
          entries[at].size = rec->allocation_size;
       }
+      if (ctx->vs->buftex_count) {
+         const unsigned at = vertex_group_count - 1;
+         entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[at].binding = GEX_WGPU_BUFTEX_SKEWS_BINDING;
+         entries[at].size = GEX_WGPU_BUFTEX_SKEWS_BYTES;
+         if (!gex_wgpu_buftex_skews(ctx, ctx->vs->buftex_count,
+                                    ctx->vs->buftex_slots, ctx->vertex_sampler_views,
+                                    &entries[at].buffer, &entries[at].offset))
+            GEX_DRAW_DROP();
+      }
       if (gex_wgpu_trace_buffer_aliasing("vertex", vertex_layout_entries,
                                         entries, vertex_group_count))
          GEX_DRAW_DROP();
@@ -50953,8 +51298,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (pipeline && needs_fragment_constant) {
       WGPUBindGroupEntry entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
                                  GEX_WGPU_MAX_SHADER_BUFFERS +
-                                 GEX_WGPU_MAX_SHADER_IMAGES +
-                                 GEX_WGPU_MAX_BUFFER_TEXTURES];
+                                 3 * GEX_WGPU_MAX_SHADER_IMAGES +
+                                 GEX_WGPU_MAX_BUFFER_TEXTURES +
+                                 /* the skew block */ 1];
       for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
          const unsigned slot = ctx->fs->ubo_slots[i];
          const struct pipe_constant_buffer *constant =
@@ -51196,10 +51542,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             buftex_size = ctx->placeholder_storage->width0;
          } else {
             buftex_buffer = gex_resource(view->texture)->buffer;
-            buftex_offset = view->u.buf.offset;
-            /* Whole texels, rounded to four; see
-             * gex_wgpu_buftex_binding_size. */
-            buftex_size = gex_wgpu_buftex_binding_size(view);
+            /* Whole texels, rounded to four, from the storage-aligned
+             * offset below the view's; see gex_wgpu_buftex_binding. */
+            gex_wgpu_buftex_binding(view, &buftex_offset, &buftex_size);
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = ctx->fs->buftex_bindings[i];
@@ -51207,6 +51552,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[at].offset = buftex_offset;
          entries[at].size = buftex_size;
       }
+      memset(ctx->packed_header_words, 0, sizeof(ctx->packed_header_words));
       for (unsigned i = 0; i < ctx->fs->packed_image_count; ++i) {
          const unsigned base = ctx->fs->ubo_count + ctx->fs->ssbo_count +
                                ctx->fs->image_count + ctx->fs->buftex_count;
@@ -51254,6 +51600,23 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             entries[at].size =
                half ? size : GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
          }
+      }
+      if (ctx->fs->packed_image_count) {
+         const unsigned header_at = ctx->fs->ubo_count + ctx->fs->ssbo_count +
+                               ctx->fs->image_count + ctx->fs->buftex_count;
+         if (!gex_wgpu_packed_headers(ctx, &entries[header_at].buffer,
+                                      &entries[header_at].offset))
+            GEX_DRAW_DROP();
+      }
+      if (ctx->fs->buftex_count) {
+         const unsigned at = fragment_group_count - 1;
+         entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[at].binding = GEX_WGPU_BUFTEX_SKEWS_BINDING;
+         entries[at].size = GEX_WGPU_BUFTEX_SKEWS_BYTES;
+         if (!gex_wgpu_buftex_skews(ctx, ctx->fs->buftex_count,
+                                    ctx->fs->buftex_slots, ctx->sampler_views,
+                                    &entries[at].buffer, &entries[at].offset))
+            GEX_DRAW_DROP();
       }
       if (gex_wgpu_trace_buffer_aliasing("fragment", fragment_layout_entries,
                                         entries, fragment_group_count))
@@ -52344,6 +52707,9 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
       wgpuQuerySetRelease(ctx->occlusion_set);
    }
    gex_wgpu_free_buffer(ctx->occlusion_resolve);
+   if (ctx->driver_words)
+      wgpuBufferRelease(ctx->driver_words);
+   free(ctx->driver_words_copy);
    gex_wgpu_free_buffer(ctx->subdata_stage);
    gex_wgpu_index_patch_apply(ctx);
    FREE(ctx->index_patches);
@@ -53147,12 +53513,12 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * shader used to fail to link. Each one is bound as a read-only storage
     * buffer and texelFetch is lowered to word loads.
     *
-    * The offset alignment is WebGPU's for a storage binding, which is what
-    * glTexBufferRange has to respect. */
+    * The offset alignment is 16, as desktop drivers report it, not the
+    * storage binding's: a range off the storage alignment is bound from below
+    * it and the shader skips the difference (gex_wgpu_buftex_skew). */
    caps->texture_buffer_objects = true;
-   /* A buffer texture is served through a storage buffer binding, so what it
-      must align to is the storage alignment the device granted. */
-   caps->texture_buffer_offset_alignment = screen->storage_offset_alignment;
+   caps->texture_buffer_offset_alignment =
+      MIN2(screen->storage_offset_alignment, 16u);
    caps->max_texel_buffer_elements =
       screen->max_storage_buffer_size ? screen->max_storage_buffer_size / 16
                                       : 65536;
